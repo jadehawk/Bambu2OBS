@@ -1,5 +1,8 @@
 pybambu
 requests
+packaging
 paho-mqtt
 python-dotenv
 python-dateutil
+flask
+flask-cors
