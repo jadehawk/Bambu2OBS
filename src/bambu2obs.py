@@ -22,21 +22,6 @@ is_first_run = True
 
 subprocesses = []  # List to keep track of subprocesses
 
-def launch_progress_server():
-    """Launches the progress bar server as a separate process."""
-    # Use the current Python interpreter to run progressbarServer.py
-    proc = subprocess.Popen([sys.executable, 'src/progressbarServer.py'])
-    subprocesses.append(proc)
-
-def cleanup_subprocesses():
-    """Terminates all running subprocesses initiated by this script."""
-    for proc in subprocesses:
-        proc.terminate()  # Terminate the subprocess
-        proc.wait()       # Wait for the subprocess to exit
-
-# Define the path for the ConnectionDumps.json file in the data subdirectory
-DUMPS_FILE_PATH = os.path.join('data', 'ConnectionDumps.json')
-
 # Retrieve environment variables
 REGION = os.getenv('REGION')
 EMAIL = os.getenv('EMAIL')
@@ -45,17 +30,70 @@ USERNAME = os.getenv('USERNAME')
 PRINTER_SN = os.getenv('PRINTER_SN')
 PRINTER_IP = os.getenv('PRINTER_IP')
 ACCESS_CODE = os.getenv('ACCESS_CODE')
-BASE_DIR = os.getenv('BASE_DIR')
+BASE_DIR = os.getenv('BASE_DIR') or 'data'
+# Optional pre-fetched cloud auth token to bypass password/2FA login flows
+CLOUD_AUTH_TOKEN = os.getenv('BAMBU_CLOUD_TOKEN')
+# Enable message dumps only when explicitly set
+DEBUG_DUMPS = os.getenv('DEBUG_DUMPS', '').lower() in ('1', 'true', 'yes', 'on', 'debug')
+
+# Define the path for the ConnectionDumps.json file in the data subdirectory
+DUMPS_FILE_PATH = os.path.join(BASE_DIR, 'ConnectionDumps.json')
+
+def launch_progress_server():
+    """Launches the progress bar server as a separate process."""
+    # Use the current Python interpreter to run progressbarServer.py
+    proc = subprocess.Popen([sys.executable, 'src/progressbarServer.py'])
+    subprocesses.append(proc)
+    return proc
+
+def cleanup_subprocesses():
+    """Terminates all running subprocesses initiated by this script."""
+    for proc in subprocesses:
+        proc.terminate()  # Terminate the subprocess
+        proc.wait()       # Wait for the subprocess to exit
+
+def stop_progressbar_server(proc=None):
+    """Terminate the provided progress bar process and any tracked subprocesses."""
+    if proc is not None:
+        try:
+            proc.terminate()
+            proc.wait()
+        except Exception as exc:
+            print(f"Failed to stop progress bar server process: {exc}")
+    cleanup_subprocesses()
 
 total_layer_num_global = None
 
 class BambuCloud:
-    def __init__(self, region: str, email: str, password: str):
+    def __init__(self, region: str, email: str, password: str, auth_token: str | None = None):
         self.region = region
         self.email = email
         self.password = password
-        self.auth_token = None
+        self.auth_token = auth_token
         self.session = requests.Session()  # Use a session for persistent connections
+
+    def _extract_auth_token(self, payload: dict):
+        """Retrieve an auth token from the possible response shapes."""
+        token = payload.get('accessToken')
+        if not token and isinstance(payload.get('data'), dict):
+            token = payload['data'].get('accessToken')
+        return token
+
+    def _authorized_get(self, url: str):
+        """Perform an authenticated GET request, refreshing the token on 401 once."""
+        if not self.auth_token:
+            self.login()
+
+        headers = {'Authorization': f'Bearer {self.auth_token}'}
+        response = self.session.get(url, headers=headers, timeout=10)
+
+        if response.status_code == 401:
+            print("Auth token rejected (401). Refreshing token and retrying once.")
+            self.login()
+            headers = {'Authorization': f'Bearer {self.auth_token}'}
+            response = self.session.get(url, headers=headers, timeout=10)
+
+        return response
 
     def _get_authentication_token(self):
         """Authenticate and retrieve access token from Bambu Cloud with session handling and headers."""
@@ -76,29 +114,36 @@ class BambuCloud:
         
         response = self.session.post(base_url, headers=headers, json=payload, timeout=10)
         if response.ok:
-            self.auth_token = response.json().get('accessToken')
+            token = self._extract_auth_token(response.json())
+            if not token:
+                login_type = response.json().get("loginType")
+                if login_type == "verifyCode":
+                    raise ValueError(
+                        "Bambu Cloud requires a verification code login for this account. "
+                        "Provide BAMBU_CLOUD_TOKEN in your .env (from Bambu Studio/Handy) or disable 2FA."
+                    )
+                raise ValueError(f"Authentication response missing access token: {response.text}")
+            self.auth_token = token
             print("Authentication successful")
         else:
             raise ValueError(f"Authentication failed with status code {response.status_code}: {response.text}")
 
     def login(self):
         """Public method to initiate login and set auth_token."""
+        if self.auth_token:
+            print("Using provided cloud auth token.")
+            return
         self._get_authentication_token()
 
     def get_device_list(self):
         """Retrieve list of devices associated with account."""
-        if not self.auth_token:
-            raise ValueError("Not authenticated")
-        
         print("Getting device list from Bambu Cloud")
         base_url = (
             'https://api.bambulab.com/v1/iot-service/api/user/bind'
             if self.region != "China" 
             else 'https://api.bambulab.cn/v1/iot-service/api/user/bind'
         )
-        headers = {'Authorization': f'Bearer {self.auth_token}'}
-        
-        response = self.session.get(base_url, headers=headers, timeout=10)
+        response = self._authorized_get(base_url)
         if response.ok:
             devices = response.json().get('devices', [])
             return devices
@@ -124,9 +169,7 @@ class BambuCloud:
             if self.region != "China"
             else 'https://api.bambulab.cn/v1/user-service/my/tasks'
         )
-        headers = {'Authorization': f'Bearer {self.auth_token}'}
-        
-        response = self.session.get(base_url, headers=headers, timeout=10)
+        response = self._authorized_get(base_url)
         if response.ok:
             return response.json()
         else:
@@ -218,7 +261,10 @@ def update_svg_with_all_tray_colors():
     ET.register_namespace('', 'http://www.w3.org/2000/svg')
     
     # Correctly read the active tray value from file
-    active_ams_tray = int(read_active_ams_tray_from_file())
+    try:
+        active_ams_tray = int(read_active_ams_tray_from_file())
+    except (TypeError, ValueError):
+        active_ams_tray = None
     
     for tray_idx in range(1, 5):
         filament_color = read_filament_color_from_file(tray_idx)
@@ -244,13 +290,13 @@ def update_svg_with_all_tray_colors():
         circle_element_id = f'Circle{tray_idx}'
         circle_element = root.find(f".//*[@id='{circle_element_id}']", namespaces)
         if circle_element is not None:
-            if tray_idx == active_ams_tray:
+            if active_ams_tray is not None and tray_idx == active_ams_tray:
                 circle_element.set('fill', 'green')  # Active tray
             else:
                 circle_element.set('fill', 'gray')  # Inactive trays
 
     # Check if the active tray is within the expected range (1-4)
-    if 1 <= active_ams_tray <= 4:
+    if active_ams_tray is not None and 1 <= active_ams_tray <= 4:
         active_tray_color = read_filament_color_from_file(active_ams_tray)
         active_rgb_color = hex_to_rgb_percent(active_tray_color) if active_tray_color and active_tray_color != 'N/A' else None
         if active_rgb_color:
@@ -274,8 +320,8 @@ def update_svg_with_all_tray_colors():
 # Load the persisted total_layer_num at script startup
 total_layer_num_global = load_from_file("total_layer_num", None)
 
-def on_connect(client, userdata, flags, rc):
-    print(f"Connected with result code {rc}")
+def on_connect(client, userdata, flags, reason_code, properties=None):
+    print(f"Connected with result code {reason_code}")
     client.subscribe(f"device/{PRINTER_SN}/report")
 
 previous_task_id = None  # Global variable to store the ID of the last known print task
@@ -290,9 +336,10 @@ def on_message(client, userdata, msg):
         # Convert numeric values to strings where necessary
         message_data_str = convert_all_to_str(message_data)
 
-        with open(DUMPS_FILE_PATH, 'a') as dumps_file:
-            json.dump({"timestamp": datetime.now().isoformat(), "message": message_data_str}, dumps_file, indent=4)
-            dumps_file.write('\n')
+        if DEBUG_DUMPS:
+            with open(DUMPS_FILE_PATH, 'a') as dumps_file:
+                json.dump({"timestamp": datetime.now().isoformat(), "message": message_data_str}, dumps_file, indent=4)
+                dumps_file.write('\n')
 
         if 'print' in message_data_str:
             handle_print_data(message_data_str['print'])
@@ -303,9 +350,12 @@ def on_message(client, userdata, msg):
                 print("New print job detected. Rerunning Bambu Cloud connection for the latest task.")
                 previous_task_id = current_task_id  # Update the last known task ID
                 # Reconnect to Bambu Cloud to fetch the latest task information
-                bambu_cloud = BambuCloud(REGION, EMAIL, PASSWORD)
-                bambu_cloud.login()
-                process_latest_task(bambu_cloud, PRINTER_SN, BASE_DIR)
+                try:
+                    bambu_cloud = BambuCloud(REGION, EMAIL, PASSWORD, auth_token=CLOUD_AUTH_TOKEN)
+                    bambu_cloud.login()
+                    process_latest_task(bambu_cloud, PRINTER_SN, BASE_DIR)
+                except Exception as auth_error:
+                    print(f"Failed to refresh latest task from cloud: {auth_error}")
     except Exception as e:
         print(f"Error processing message: {e}")
 
@@ -382,20 +432,31 @@ def handle_print_data(print_data):
 
     # Process AMS trays
     if 'ams' in print_data and 'ams' in print_data['ams']:
-        for tray in print_data['ams']['ams'][0]['tray']:
-            tray_idx = int(tray['id']) + 1  # Adjusting from 0-based to 1-based indexing
-            filament_id = tray.get('tray_info_idx', 'Unknown')
-            filament_color = tray.get('tray_color', 'N/A')
-            filament_name = FILAMENT_NAMES.get(filament_id, "Unknown Filament")
-            write_to_file(f'ams{tray_idx}FilamentId', filament_id)
-            write_to_file(f'ams{tray_idx}FilamentColor', filament_color)
-            write_to_file(f'ams{tray_idx}FilamentName', filament_name)
+        ams_entries = print_data['ams']['ams']
+        if ams_entries and 'tray' in ams_entries[0]:
+            for tray in ams_entries[0]['tray']:
+                tray_idx = int(tray['id']) + 1  # Adjusting from 0-based to 1-based indexing
+                filament_id = tray.get('tray_info_idx', 'Unknown')
+                filament_color = tray.get('tray_color', 'N/A')
+                filament_name = FILAMENT_NAMES.get(filament_id, "Unknown Filament")
+                write_to_file(f'ams{tray_idx}FilamentId', filament_id)
+                write_to_file(f'ams{tray_idx}FilamentColor', filament_color)
+                write_to_file(f'ams{tray_idx}FilamentName', filament_name)
+        else:
+            print("AMS data present but no tray info available; skipping tray processing.")
 
     # Process active AMS tray
     if 'ams' in print_data and 'tray_now' in print_data['ams']:
-        active_tray = int(print_data['ams']['tray_now']) + 1  # Adjusting from 0-based to 1-based indexing
-        write_to_file('activeAmsTray', str(active_tray))
-        update_svg_with_all_tray_colors()
+        try:
+            active_tray_zero_based = int(print_data['ams']['tray_now'])
+            if 0 <= active_tray_zero_based <= 3:
+                active_tray = active_tray_zero_based + 1  # Adjusting from 0-based to 1-based indexing
+                write_to_file('activeAmsTray', str(active_tray))
+                update_svg_with_all_tray_colors()
+            else:
+                print(f"Ignoring invalid active AMS tray value: {active_tray_zero_based}")
+        except (TypeError, ValueError):
+            print(f"Could not parse active AMS tray value: {print_data['ams']['tray_now']}")
 
 def format_time_hms(seconds):
     """Formats time from seconds to 'HhMmSs'."""
@@ -406,8 +467,16 @@ def format_time_hms(seconds):
 
 def process_latest_task(bambu_cloud, printer_sn, base_dir, force_update=False):
     global is_first_run
+    if bambu_cloud is None:
+        print("Cloud client not available; skipping latest task processing.")
+        return
+
     latest_task = bambu_cloud.get_latest_task_for_printer(printer_sn)
     task_id_file_path = os.path.join(base_dir, 'latest_task_id.txt')
+
+    if not latest_task:
+        print("No tasks found for this printer. Skipping task processing.")
+        return
 
     # Read the last processed task ID if exists
     try:
@@ -457,7 +526,11 @@ def process_latest_task(bambu_cloud, printer_sn, base_dir, force_update=False):
 
 
 def setup_mqtt_listener():
-    client = mqtt.Client()
+    try:
+        client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+    except AttributeError:
+        # Fallback for older paho-mqtt versions
+        client = mqtt.Client()
     client.tls_set(tls_version=ssl.PROTOCOL_TLS, cert_reqs=ssl.CERT_NONE)
     client.tls_insecure_set(True)
     client.on_connect = on_connect
@@ -472,11 +545,15 @@ def main():
     and handle MQTT messages for Bambu 3D printer status updates.
     """
     print("Initializing Bambu Cloud connection...")
-    bambu_cloud = BambuCloud(REGION, EMAIL, PASSWORD)
-    bambu_cloud.login()
-    print("Bambu Cloud connection initialized.")
+    try:
+        bambu_cloud = BambuCloud(REGION, EMAIL, PASSWORD, auth_token=CLOUD_AUTH_TOKEN)
+        bambu_cloud.login()
+        print("Bambu Cloud connection initialized.")
+    except Exception as e:
+        bambu_cloud = None
+        print(f"Unable to initialize Bambu Cloud connection: {e}")
     
-    # Process the latest task from Bambu Cloud, forcing update on the first run
+    # Process the latest task from Bambu Cloud, forcing update on the first run (if available)
     process_latest_task(bambu_cloud, PRINTER_SN, BASE_DIR, force_update=is_first_run)
 
     server_proc = launch_progress_server()
