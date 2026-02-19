@@ -303,7 +303,7 @@ def printpreview_view():
             }
 
             refreshPreview();
-            setInterval(refreshPreview, 1000);
+            setInterval(refreshPreview, 2500);
         </script>
     </body>
     </html>
@@ -445,7 +445,7 @@ def progressbar_view():
         }
 
         refreshOverlay();
-        setInterval(refreshOverlay, 1000);
+        setInterval(refreshOverlay, 2500);
     </script>
 
     </body>
@@ -498,4 +498,6 @@ def view_svg(filename):
     return "File not found", 404
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    # Disable the Flask reloader to avoid recursive subprocess spawning when
+    # this script is launched from bambu2obs.py.
+    app.run(debug=False, use_reloader=False, port=5000)
