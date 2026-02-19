@@ -1,4 +1,5 @@
 pybambu
+bambu-lab-cloud-api
 requests
 packaging
 paho-mqtt

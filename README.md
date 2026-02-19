@@ -3,7 +3,7 @@
 ## Overview
 Bambu2OBS is a tool that connects your Bambu Lab 3D printer to OBS Studio, allowing you to monitor and display real-time print progress directly in OBS. Ideal for content creators who want to showcase live 3D printing projects or create timelapses with accurate status updates.
 
-This project integrates Bambu 3D printers with OBS Studio, offering real-time monitoring and display of printing progress. It uses the `pybambu` library for interfacing with Bambu 3D printers and Flask for serving dynamic content.
+This project integrates Bambu 3D printers with OBS Studio, offering real-time monitoring and display of printing progress. It uses local printer MQTT/FTPS for live status and the `bambu-lab-cloud-api` client for cloud task metadata (profile name, cover image, etc.), with Flask serving dynamic overlay content.
 
 You can watch live demonstrations of this setup on my [Twitch channel](https://www.twitch.tv/fluidprints), where I monitor my 3D prints.
 
@@ -61,17 +61,20 @@ pip install -r requirements.txt
 ```
 
 ### Configuration
-Copy .env.example to .env and adjust the configuration parameters according to your environment and Bambu 3D printer settings.
-### Configuration
-In order to connect to your Bambu printer, set the following environment variables in the `.env.example` file and rename it to`.env`:
+Copy `example.env` to `.env` and adjust the configuration parameters according to your environment and Bambu printer settings.
+
+In order to connect to your Bambu printer, set the following environment variables in `.env`:
 
 - **EMAIL**: Your Bambu Cloud account email.
 - **PASSWORD**: Your Bambu Cloud account password.
-- **REGION**: Set to "China" if using the Chinese Bambu Cloud; otherwise, set to "global".
+- **REGION**: Set to `china` if using the Chinese Bambu Cloud; otherwise set to `global`.
 - **PRINTER_SN**: The serial number of your Bambu Lab printer.
 - **PRINTER_IP**: The IP address of your printer on your local network.
 - **ACCESS_CODE**: Access code from your printer settings.
-- **BASE_DIR**: name of the folder that will store the print job data used for the overlays.
+- **BASE_DIR**: Name of the folder that will store the print job data used for overlays.
+- **BAMBU_CLOUD_TOKEN**: Optional but recommended cloud token. This avoids interactive verification-code (2FA) login issues in unattended runs.
+
+If `BAMBU_CLOUD_TOKEN` is empty, Bambu2OBS will attempt login with `EMAIL` + `PASSWORD`. Accounts that require verification-code login should set `BAMBU_CLOUD_TOKEN`.
 
 ### Running the Application
 1. Start the Flask server:
@@ -99,6 +102,8 @@ This imported scene provides an easy way to visualize your print progress in OBS
 This project is open-source under the MIT License. If you use or adapt Bambu2OBS, please provide credit to [fluidman](https://github.com/fluidman) and reference this repository.
 
 Special thanks to Greg Hesp for the `pybambu` library, which facilitates communication with Bambu 3D printers. GitHub repository: [pybambu](https://github.com/greghesp/pybambu).
+
+Cloud API integration is powered by [coelacant1/Bambu-Lab-Cloud-API](https://github.com/coelacant1/Bambu-Lab-Cloud-API).
 
 ### License
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.

@@ -133,6 +133,35 @@ class SdPreviewFallbackTests(unittest.TestCase):
         self.assertTrue(print_cover_text_path.exists())
         self.assertEqual(print_cover_text_path.read_text(encoding="utf-8").strip(), "N/A")
 
+    def test_extract_task_preview_urls_prefers_cover_then_thumbnail(self):
+        task_data = {
+            "cover": "https://example.com/cover.png",
+            "thumbnail": "https://example.com/thumb.png"
+        }
+
+        urls = self.module.extract_task_preview_urls(task_data)
+
+        self.assertEqual(
+            urls,
+            ["https://example.com/cover.png", "https://example.com/thumb.png"]
+        )
+
+    def test_extract_task_preview_urls_reads_nested_task_message_and_deduplicates(self):
+        task_data = {
+            "cover": "https://example.com/cover.png",
+            "taskMessage": {
+                "cover": "https://example.com/cover.png",
+                "thumbnail": "https://example.com/thumb.png"
+            }
+        }
+
+        urls = self.module.extract_task_preview_urls(task_data)
+
+        self.assertEqual(
+            urls,
+            ["https://example.com/cover.png", "https://example.com/thumb.png"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

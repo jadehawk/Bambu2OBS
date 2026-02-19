@@ -2,7 +2,6 @@ from dotenv import load_dotenv
 import os
 import ssl
 import ftplib
-from pybambu import BambuClient
 from pybambu.const import SPEED_PROFILE, FILAMENT_NAMES, CURRENT_STAGE_IDS
 import paho.mqtt.client as mqtt
 import json
@@ -13,13 +12,25 @@ import re
 from datetime import datetime, timedelta
 import time
 import socket
-import requests
 import subprocess
 import signal
 import sys
 import xml.etree.ElementTree as ET
 from collections import deque
 from pathlib import Path
+
+try:
+    from bambulab import (
+        BambuAuthenticator,
+        BambuAuthError,
+        BambuClient as CloudApiClient,
+        BambuAPIError,
+    )
+except ImportError:
+    BambuAuthenticator = None
+    BambuAuthError = Exception
+    CloudApiClient = None
+    BambuAPIError = Exception
 
 # Load environment variables
 load_dotenv()
@@ -416,107 +427,122 @@ def stop_progressbar_server(proc=None):
 
 total_layer_num_global = None
 
+def normalize_cloud_region(region: str | None) -> str:
+    value = str(region or '').strip().lower()
+    return 'china' if value in {'china', 'cn'} else 'global'
+
+
+def cloud_api_base_url(normalized_region: str) -> str:
+    return 'https://api.bambulab.cn' if normalized_region == 'china' else 'https://api.bambulab.com'
+
+
 class BambuCloud:
     def __init__(self, region: str, email: str, password: str, auth_token: str | None = None):
-        self.region = region
+        self.region = normalize_cloud_region(region)
         self.email = email
         self.password = password
-        self.auth_token = auth_token
-        self.session = requests.Session()  # Use a session for persistent connections
-        self.session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/85.0.4183.121 Safari/537.36"
-            )
-        })
+        self.auth_token = (auth_token or '').strip() or None
         self._device_id_cache = {}
+        self.client = None
+        self.session = None
+        self.authenticator = None
 
-    def _extract_auth_token(self, payload: dict):
-        """Retrieve an auth token from the possible response shapes."""
-        token = payload.get('accessToken')
-        if not token and isinstance(payload.get('data'), dict):
-            token = payload['data'].get('accessToken')
+        if BambuAuthenticator is not None:
+            self.authenticator = BambuAuthenticator(region=self.region)
+
+    def _requires_token_refresh(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        return '401' in message or 'unauthorized' in message
+
+    def _code_callback(self):
+        raise BambuAuthError(
+            "Bambu Cloud requires an interactive verification code login. "
+            "Set BAMBU_CLOUD_TOKEN in .env (from Bambu Studio or Bambu Handy)."
+        )
+
+    def _build_client(self, token: str):
+        if CloudApiClient is None:
+            raise ImportError(
+                "Missing dependency 'bambu-lab-cloud-api'. "
+                "Install it with: pip install bambu-lab-cloud-api"
+            )
+        client = CloudApiClient(token=token)
+        client.BASE_URL = cloud_api_base_url(self.region)
+        return client
+
+    def _obtain_token(self, force_new: bool = False) -> str:
+        if self.auth_token and not force_new:
+            return self.auth_token
+
+        if self.authenticator is None:
+            raise ImportError(
+                "Missing dependency 'bambu-lab-cloud-api'. "
+                "Install it with: pip install bambu-lab-cloud-api"
+            )
+
+        if not self.email or not self.password:
+            raise ValueError("EMAIL and PASSWORD must be set when BAMBU_CLOUD_TOKEN is not provided.")
+
+        try:
+            token = self.authenticator.get_or_create_token(
+                username=self.email,
+                password=self.password,
+                code_callback=self._code_callback,
+                force_new=force_new
+            )
+        except BambuAuthError as exc:
+            raise ValueError(f"Bambu Cloud authentication failed: {exc}") from exc
+
+        if not token:
+            raise ValueError("Bambu Cloud authentication returned an empty token.")
+
+        self.auth_token = token
         return token
 
-    def _authorized_get(self, url: str):
-        """Perform an authenticated GET request, refreshing the token on 401 once."""
-        if not self.auth_token:
-            self.login()
-
-        headers = {'Authorization': f'Bearer {self.auth_token}'}
-        response = self.session.get(url, headers=headers, timeout=10)
-
-        if response.status_code == 401:
-            print("Auth token rejected (401). Refreshing token and retrying once.")
-            self.login()
-            headers = {'Authorization': f'Bearer {self.auth_token}'}
-            response = self.session.get(url, headers=headers, timeout=10)
-
-        return response
-
-    def _get_authentication_token(self):
-        """Authenticate and retrieve access token from Bambu Cloud with session handling and headers."""
-        print("Getting accessToken from Bambu Cloud")
-        
-        base_url = (
-            'https://api.bambulab.com/v1/user-service/user/login'
-            if self.region != "China" 
-            else 'https://api.bambulab.cn/v1/user-service/user/login'
-        )
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/85.0.4183.121 Safari/537.36"
-        }
-        payload = {
-            "account": self.email,
-            "password": self.password
-        }
-        
-        response = self.session.post(base_url, headers=headers, json=payload, timeout=10)
-        if response.ok:
-            token = self._extract_auth_token(response.json())
-            if not token:
-                login_type = response.json().get("loginType")
-                if login_type == "verifyCode":
-                    raise ValueError(
-                        "Bambu Cloud requires a verification code login for this account. "
-                        "Provide BAMBU_CLOUD_TOKEN in your .env (from Bambu Studio/Handy) or disable 2FA."
-                    )
-                raise ValueError(f"Authentication response missing access token: {response.text}")
-            self.auth_token = token
-            print("Authentication successful")
-        else:
-            raise ValueError(f"Authentication failed with status code {response.status_code}: {response.text}")
-
-    def login(self):
-        """Public method to initiate login and set auth_token."""
-        if self.auth_token:
-            print("Using provided cloud auth token.")
+    def login(self, force_new: bool = False):
+        """Initialize authenticated Cloud API client."""
+        if self.client is not None and self.auth_token and not force_new:
             return
-        self._get_authentication_token()
+
+        if self.auth_token and not force_new:
+            token = self.auth_token
+        else:
+            token = self._obtain_token(force_new=force_new)
+
+        self.client = self._build_client(token)
+        self.session = self.client.session
+
+    def _api_get(self, endpoint: str, params: dict | None = None):
+        if self.client is None:
+            self.login()
+
+        try:
+            return self.client.get(endpoint, params=params)
+        except BambuAPIError as exc:
+            if self._requires_token_refresh(exc) and self.email and self.password:
+                print("Auth token rejected (401). Refreshing token and retrying once.")
+                self.login(force_new=True)
+                return self.client.get(endpoint, params=params)
+            raise
 
     def get_device_list(self):
         """Retrieve list of devices associated with account."""
         print("Getting device list from Bambu Cloud")
-        base_url = (
-            'https://api.bambulab.com/v1/iot-service/api/user/bind'
-            if self.region != "China" 
-            else 'https://api.bambulab.cn/v1/iot-service/api/user/bind'
-        )
-        response = self._authorized_get(base_url)
-        if response.ok:
-            payload = response.json()
-            devices = payload.get('devices')
-            if devices is None and isinstance(payload.get('data'), dict):
-                devices = payload['data'].get('devices')
-            return devices or []
-        else:
-            raise ValueError(f"Failed to fetch device list with status code {response.status_code}")
+        payload = self._api_get('v1/iot-service/api/user/bind')
+        devices = payload.get('devices') if isinstance(payload, dict) else None
+        if devices is None and isinstance(payload, dict) and isinstance(payload.get('data'), dict):
+            devices = payload['data'].get('devices')
+        return devices or []
 
     def _extract_task_hits(self, payload: dict) -> list:
         """Extract task list from known response shapes."""
         if not isinstance(payload, dict):
             return []
+
+        tasks = payload.get('tasks')
+        if isinstance(tasks, list):
+            return tasks
+
         hits = payload.get('hits')
         if isinstance(hits, list):
             return hits
@@ -524,8 +550,13 @@ class BambuCloud:
             inner_hits = hits.get('hits')
             if isinstance(inner_hits, list):
                 return inner_hits
+
         data = payload.get('data')
         if isinstance(data, dict):
+            tasks = data.get('tasks')
+            if isinstance(tasks, list):
+                return tasks
+
             hits = data.get('hits')
             if isinstance(hits, list):
                 return hits
@@ -533,9 +564,11 @@ class BambuCloud:
                 inner_hits = hits.get('hits')
                 if isinstance(inner_hits, list):
                     return inner_hits
+
             tasks = data.get('list')
             if isinstance(tasks, list):
                 return tasks
+
         return []
 
     def get_device_id_for_serial(self, printer_sn: str):
@@ -556,6 +589,7 @@ class BambuCloud:
                 or device.get('serial')
                 or device.get('device_sn')
                 or device.get('printerSn')
+                or device.get('dev_id')
             )
             if serial == printer_sn:
                 device_id = (
@@ -570,51 +604,88 @@ class BambuCloud:
         print(f"No deviceId found for printer serial {printer_sn}.")
         return None
 
+    def _task_matches_identifier(self, task: dict, identifier: str) -> bool:
+        if not isinstance(task, dict):
+            return False
+        if not identifier:
+            return True
+        task_identifiers = (
+            task.get('deviceId'),
+            task.get('device_id'),
+            task.get('device_sn'),
+            task.get('sn'),
+            task.get('printerSn')
+        )
+        return any(value == identifier for value in task_identifiers)
+
+    def _task_sort_key(self, task: dict):
+        task_id = str(task.get('id', '')).strip()
+        timestamp_fields = (
+            'endTime',
+            'startTime',
+            'createTime',
+            'updatedAt',
+            'createdAt'
+        )
+        for field in timestamp_fields:
+            value = str(task.get(field, '')).strip()
+            if not value:
+                continue
+            try:
+                normalized = value.replace('Z', '+00:00')
+                parsed_time = datetime.fromisoformat(normalized)
+                return (2, parsed_time.timestamp(), task_id)
+            except ValueError:
+                continue
+
+        # Fallback: sortable numeric ID when timestamp fields are unavailable.
+        if task_id.isdigit():
+            return (1, int(task_id), task_id)
+        return (0, 0, task_id)
+
     def get_latest_task_for_printer(self, identifier: str):
         """Fetch the latest task for a printer by device ID or serial."""
         print(f"Fetching latest task for printer identifier: {identifier}")
-        tasklist = self.get_tasklist()
-        
+        tasklist = self.get_tasklist(device_id=identifier, limit=20)
         tasks = self._extract_task_hits(tasklist)
-        for task in tasks:
-            if task.get('deviceId') == identifier:
-                return task
-            if task.get('device_sn') == identifier or task.get('sn') == identifier or task.get('printerSn') == identifier:
-                return task
-        return None
 
-    def get_tasklist(self):
-        """Fetches the task list from Bambu Cloud."""
+        if not tasks:
+            # Some accounts reject filter params; retry without them.
+            tasklist = self.get_tasklist(limit=50)
+            tasks = self._extract_task_hits(tasklist)
+
+        matching = [task for task in tasks if self._task_matches_identifier(task, identifier)]
+        candidates = matching or tasks
+        if not candidates:
+            return None
+
+        candidates.sort(key=self._task_sort_key, reverse=True)
+        return candidates[0]
+
+    def get_tasklist(self, device_id: str | None = None, limit: int = 20):
+        """Fetch the task list from Bambu Cloud."""
         print("Fetching task list from Bambu Cloud")
-        base_url = (
-            'https://api.bambulab.com/v1/user-service/my/tasks'
-            if self.region != "China"
-            else 'https://api.bambulab.cn/v1/user-service/my/tasks'
-        )
-        response = self._authorized_get(base_url)
-        if response.ok:
-            return response.json()
-        else:
-            raise ValueError(f"Failed to fetch task list with status code {response.status_code}")
+        params = {}
+        if device_id:
+            params['deviceId'] = device_id
+        if limit:
+            params['limit'] = int(limit)
+        try:
+            return self._api_get('v1/user-service/my/tasks', params=params or None)
+        except Exception as primary_error:
+            print(f"Primary task endpoint failed ({primary_error}); falling back to iot-service endpoint.")
+            fallback_params = {}
+            if device_id:
+                fallback_params['device_id'] = device_id
+            if limit:
+                fallback_params['limit'] = int(limit)
+            return self._api_get('v1/iot-service/api/user/task', params=fallback_params or None)
 
-        
+
 if not os.path.exists(BASE_DIR):
     os.makedirs(BASE_DIR, exist_ok=True)
 
 update_writer_status(state="initialized")
-
-def get_auth_token(email, password, region):
-    print("Getting accessToken from Bambu Cloud")
-    # Corrected: Directly use 'region' parameter instead of 'self.region'
-    base_url = 'https://api.bambulab.com/v1/user-service/user/login' if region != "China" else 'https://api.bambulab.cn/v1/user-service/user/login'
-    data = {'account': email, 'password': password}  # Corrected: Directly use 'email' and 'password' parameters
-    response = requests.post(base_url, json=data, timeout=10)
-    if response.ok:
-        auth_token = response.json()['accessToken']
-        print("Authentication successful")
-        return auth_token  # Return the obtained token
-    else:
-        raise ValueError(f"Authentication failed with status code {response.status_code}")
         
 def format_remaining_time(minutes):
     """Formats remaining time from minutes to '-HhMm'."""
@@ -1046,6 +1117,59 @@ def format_time_hms(seconds):
     minutes, seconds = divmod(remainder, 60)
     return f"{hours}h {minutes}m {seconds}s"
 
+def extract_task_preview_urls(task_data):
+    """Return ordered preview URL candidates from task metadata."""
+    if not isinstance(task_data, dict):
+        return []
+
+    urls = []
+    seen = set()
+    sources = [task_data]
+    task_message = task_data.get('taskMessage')
+    if isinstance(task_message, dict):
+        sources.append(task_message)
+
+    for source in sources:
+        for field in ('cover', 'thumbnail', 'preview', 'image'):
+            value = str(source.get(field, '')).strip()
+            if not value or value in ('N/A', 'Unknown'):
+                continue
+            if value not in seen:
+                seen.add(value)
+                urls.append(value)
+
+    return urls
+
+def download_cloud_preview_image(bambu_cloud, preview_url: str):
+    """Download preview bytes using the cloud client session."""
+    if not bambu_cloud or not preview_url:
+        return None, None
+
+    if bambu_cloud.session is None:
+        bambu_cloud.login()
+
+    request_attempts = []
+    if bambu_cloud.auth_token:
+        request_attempts.append((
+            "authorized",
+            {'Authorization': f"Bearer {bambu_cloud.auth_token}"}
+        ))
+    request_attempts.append(("plain", None))
+
+    for mode, headers in request_attempts:
+        try:
+            request_kwargs = {'timeout': 10}
+            if headers:
+                request_kwargs['headers'] = headers
+            response = bambu_cloud.session.get(preview_url, **request_kwargs)
+            if response.ok and response.content:
+                return response.content, mode
+            print(f"Preview download attempt '{mode}' returned HTTP {response.status_code} for {preview_url}")
+        except Exception as exc:
+            print(f"Preview download attempt '{mode}' failed for {preview_url}: {exc}")
+
+    return None, None
+
 
 def process_latest_task(bambu_cloud, printer_sn, base_dir, force_update=False):
     global is_first_run, previous_task_id, latest_print_data
@@ -1082,7 +1206,8 @@ def process_latest_task(bambu_cloud, printer_sn, base_dir, force_update=False):
         # Extract and write required information from the task
         designTitle = latest_task.get('designTitle', 'N/A')
         printProfile = latest_task.get('title', 'N/A')
-        printCover = latest_task.get('cover', 'N/A')
+        preview_urls = extract_task_preview_urls(latest_task)
+        printCover = preview_urls[0] if preview_urls else 'N/A'
         totalWeight = str(latest_task.get('weight', 'N/A')) + "g"
         totalTime = int(latest_task.get('costTime', 0))
         totalTimeFormatted = format_time_hms(totalTime)  # Use the new format function
@@ -1096,17 +1221,14 @@ def process_latest_task(bambu_cloud, printer_sn, base_dir, force_update=False):
 
         # Download and save print cover image if available
         cover_downloaded = False
-        if printCover and printCover != 'N/A':
-            try:
-                cover_response = bambu_cloud.session.get(printCover, timeout=10)
-                if cover_response.ok and cover_response.content:
-                    cover_downloaded = save_print_cover_image(cover_response.content, f"cloud:{printCover}")
+        if preview_urls:
+            for preview_url in preview_urls:
+                preview_bytes, download_mode = download_cloud_preview_image(bambu_cloud, preview_url)
+                if preview_bytes:
+                    cover_downloaded = save_print_cover_image(preview_bytes, f"cloud:{preview_url}")
                     if cover_downloaded:
-                        print(f"Downloaded print cover from cloud URL: {printCover}")
-                else:
-                    print(f"Cover download failed with status code {cover_response.status_code}.")
-            except Exception as exc:
-                print(f"Failed to download print cover: {exc}")
+                        print(f"Downloaded print cover from cloud URL ({download_mode}): {preview_url}")
+                        break
         else:
             print("No print cover URL available for this task.")
 
