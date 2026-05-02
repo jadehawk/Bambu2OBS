@@ -42,6 +42,10 @@ PLACEHOLDER_PREVIEW_SVG = """<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 
 <line x1='150' y1='220' x2='300' y2='140' stroke='#0d0d0d' stroke-width='35'/>
 </svg>"""
 
+# Assets directory (logo, icons, etc.)
+ASSETS_DIR = os.path.join(Path(__file__).resolve().parent.parent, 'assets')
+LOGO_FILENAME = 'logo.png'
+
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
@@ -317,137 +321,114 @@ def progressbar_view():
     <html lang="en">
     <head>
         <meta charset="UTF-8">
-        <title>Customized Bootstrap Progress Bar for OBS</title>
-        <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+        <title>Progress Bar for OBS</title>
         <style>
             html, body {
                 margin: 0;
                 padding: 0;
+                width: 100%;
+                height: 100%;
+                overflow: hidden;
+                background-color: transparent;
+            }
+            .progress-track {
+                width: 100%;
+                height: 100%;
+                background-color: #EEEEEE;
+                border-radius: 4px;
                 overflow: hidden;
             }
-            .overlay-wrapper {
-                padding: 10px;
-                max-width: 600px;
-                margin: 0 auto;
-                display: flex;
-                flex-direction: column;
-                gap: 10px;
-                font-family: "Segoe UI", Tahoma, sans-serif;
-                color: #f5f5f5;
-                background-color: rgba(0,0,0,0.0);
-            }
-            .job-info {
-                display: flex;
-                align-items: center;
-            }
-            .job-cover {
-                width: 128px;
-                height: 128px;
-                border-radius: 8px;
-                object-fit: contain;
-                margin-right: 14px;
-                background-color: transparent;
-                display: none;
-                /* filter: invert(100%); */
-            }
-            .job-cover.visible {
-                display: block;
-            }
-            .job-name {
-                font-size: 1.1rem;
-                font-weight: 600;
-                margin-bottom: 8px;
-            }
-            .progress {
-                background-color: #EEEEEE;
-                height: 30px;
-                margin: 0;
-                width: 100%;
-            }
-            .progress-bar {
+            .progress-fill {
+                height: 100%;
+                width: 0%;
                 background-color: #00AE42;
+                border-radius: 4px;
+                transition: width 0.5s ease;
             }
         </style>
     </head>
     <body>
-
-    <div class="overlay-wrapper">
-        <div class="job-info">
-            <img id="job-cover" class="job-cover" alt="Print cover preview">
-            <div class="job-details w-100">
-                <div id="job-name" class="job-name">Loading print...</div>
-                <div class="progress">
-                    <div id="progress-bar" class="progress-bar" role="progressbar" style="width: 0%;" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div>
-                </div>
-            </div>
+        <div class="progress-track">
+            <div id="progress-fill" class="progress-fill"></div>
         </div>
-    </div>
+        <script>
+            const progressFill = document.getElementById('progress-fill');
+            const baseUrl = (window.location.origin && window.location.origin !== 'null')
+                ? window.location.origin
+                : 'http://localhost:5000';
 
-    <script>
-        const PLACEHOLDER_COVER = "data:image/svg+xml;charset=UTF-8,%3Csvg%20xmlns%3D%27http%3A//www.w3.org/2000/svg%27%20viewBox%3D%270%200%20300%20400%27%3E%3Crect%20width%3D%27300%27%20height%3D%27400%27%20fill%3D%27%232f2f2f%27/%3E%3Cline%20x1%3D%27150%27%20y1%3D%270%27%20x2%3D%27150%27%20y2%3D%27400%27%20stroke%3D%27%230d0d0d%27%20stroke-width%3D%2735%27/%3E%3Cline%20x1%3D%270%27%20y1%3D%27280%27%20x2%3D%27150%27%20y2%3D%27220%27%20stroke%3D%27%230d0d0d%27%20stroke-width%3D%2735%27/%3E%3Cline%20x1%3D%27150%27%20y1%3D%27220%27%20x2%3D%27300%27%20y2%3D%27140%27%20stroke%3D%27%230d0d0d%27%20stroke-width%3D%2735%27/%3E%3C/svg%3E";
-        const jobCover = document.getElementById('job-cover');
-        const jobName = document.getElementById('job-name');
-        const progressBar = document.getElementById('progress-bar');
-        const baseUrl = (window.location.origin && window.location.origin !== 'null')
-            ? window.location.origin
-            : 'http://localhost:5000';
+            function buildUrl(path) {
+                const url = new URL(path, baseUrl);
+                url.searchParams.set('t', Date.now());
+                return url.toString();
+            }
 
-        function buildUrl(path) {
-            const url = new URL(path, baseUrl);
-            url.searchParams.set('t', Date.now());
-            return url.toString();
-        }
+            function updateProgress() {
+                fetch(buildUrl('/progress'), { cache: 'no-store' })
+                    .then(response => response.json())
+                    .then(data => {
+                        const numericValue = parseFloat(data.progress);
+                        if (!Number.isFinite(numericValue)) return;
+                        const clampedValue = Math.min(100, Math.max(0, numericValue));
+                        progressFill.style.width = clampedValue + '%';
+                    })
+                    .catch(error => console.error('Error fetching progress:', error));
+            }
 
-        function showPlaceholderCover() {
-            jobCover.src = PLACEHOLDER_COVER;
-            jobCover.classList.add('visible');
-        }
-
-        jobCover.addEventListener('error', () => {
-            showPlaceholderCover();
-        }, { once: false });
-
-        function updateProgress() {
-            fetch(buildUrl('/progress'), { cache: 'no-store' })
-                .then(response => response.json())
-                .then(data => {
-                    const numericValue = parseFloat(data.progress);
-                    if (!Number.isFinite(numericValue)) {
-                        return;
-                    }
-                    const clampedValue = Math.min(100, Math.max(0, numericValue));
-                    progressBar.style.width = `${clampedValue}%`;
-                    progressBar.setAttribute('aria-valuenow', clampedValue);
-                })
-                .catch(error => console.error('Error fetching progress:', error));
-        }
-
-        function updateJobInfo() {
-            fetch(buildUrl('/job-info'), { cache: 'no-store' })
-                .then(response => response.json())
-                .then(data => {
-                    jobName.textContent = data.job_name || 'Unknown Print';
-                    if (data.has_cover && data.cover_url) {
-                        const coverUrl = new URL(data.cover_url, baseUrl);
-                        coverUrl.searchParams.set('t', Date.now());
-                        jobCover.src = coverUrl.toString();
-                        jobCover.classList.add('visible');
-                    } else {
-                        showPlaceholderCover();
-                    }
-                })
-                .catch(error => console.error('Error fetching job info:', error));
-        }
-
-        function refreshOverlay() {
             updateProgress();
-            updateJobInfo();
-        }
+            setInterval(updateProgress, 2500);
+        </script>
+    </body>
+    </html>
+    """
+    return render_template_string(html)
 
-        refreshOverlay();
-        setInterval(refreshOverlay, 2500);
-    </script>
+@app.route('/logo')
+def serve_logo():
+    """Serve the project logo from the assets directory."""
+    logo_path = os.path.join(ASSETS_DIR, LOGO_FILENAME)
+    if os.path.exists(logo_path):
+        response = send_from_directory(ASSETS_DIR, LOGO_FILENAME)
+        response.headers['Cache-Control'] = 'no-store, max-age=0'
+        return response
+    return "Logo not found", 404
 
+@app.route('/view/logo')
+def logo_view():
+    """Browser-source-friendly page that displays the logo with a transparent background."""
+    html = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Logo</title>
+        <style>
+            html, body {
+                margin: 0;
+                padding: 0;
+                width: 100%;
+                height: 100%;
+                overflow: hidden;
+                background: transparent;
+            }
+            .logo-wrapper {
+                width: 100%;
+                height: 100%;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+            .logo-image {
+                width: 100%;
+                height: 100%;
+                object-fit: contain;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="logo-wrapper">
+            <img class="logo-image" src="/logo" alt="Logo">
+        </div>
     </body>
     </html>
     """

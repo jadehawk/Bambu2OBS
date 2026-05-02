@@ -117,9 +117,9 @@
             "versioned_id": "browser_source",
             "settings": {
                 "is_local_file": false,
-                "local_file": "C:/Bambu2OBS_project/data/ActiveFilament.svg",
+                "local_file": "BAMBU2OBS_DATA/ActiveFilament.svg",
                 "url": "http://localhost:5000/view/ActiveFilament.svg",
-                "width": 420,
+                "width": 502,
                 "height": 130,
                 "restart_when_active": true
             },
@@ -154,7 +154,7 @@
             "versioned_id": "text_gdiplus_v2",
             "settings": {
                 "read_from_file": true,
-                "file": "C:/BambuVenv/assets/amstray1_1_id.txt",
+                "file": "BAMBU2OBS_DATA/ams1FilamentColorName.txt",
                 "font": {
                     "face": "Arial",
                     "style": "Bold",
@@ -187,7 +187,7 @@
             "versioned_id": "text_gdiplus_v2",
             "settings": {
                 "read_from_file": true,
-                "file": "C:/BambuVenv/assets/amstray1_2_id.txt",
+                "file": "BAMBU2OBS_DATA/ams2FilamentColorName.txt",
                 "font": {
                     "face": "Arial",
                     "style": "Bold",
@@ -220,7 +220,7 @@
             "versioned_id": "text_gdiplus_v2",
             "settings": {
                 "read_from_file": true,
-                "file": "C:/BambuVenv/assets/amstray1_3_id.txt",
+                "file": "BAMBU2OBS_DATA/ams3FilamentColorName.txt",
                 "font": {
                     "face": "Arial",
                     "style": "Bold",
@@ -253,7 +253,40 @@
             "versioned_id": "text_gdiplus_v2",
             "settings": {
                 "read_from_file": true,
-                "file": "C:/BambuVenv/assets/amstray1_3_id.txt",
+                "file": "BAMBU2OBS_DATA/ams4FilamentColorName.txt",
+                "font": {
+                    "face": "Arial",
+                    "style": "Bold",
+                    "size": 12,
+                    "flags": 1
+                }
+            },
+            "mixers": 0,
+            "sync": 0,
+            "flags": 0,
+            "volume": 1.0,
+            "balance": 0.5,
+            "enabled": true,
+            "muted": false,
+            "push-to-mute": false,
+            "push-to-mute-delay": 0,
+            "push-to-talk": false,
+            "push-to-talk-delay": 0,
+            "hotkeys": {},
+            "deinterlace_mode": 0,
+            "deinterlace_field_order": 0,
+            "monitoring_type": 0,
+            "private_settings": {}
+        },
+        {
+            "prev_ver": 503447555,
+            "name": "AMS1TrayEXT_type",
+            "uuid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+            "id": "text_gdiplus",
+            "versioned_id": "text_gdiplus_v2",
+            "settings": {
+                "read_from_file": true,
+                "file": "BAMBU2OBS_DATA/ams5FilamentColorName.txt",
                 "font": {
                     "face": "Arial",
                     "style": "Bold",
@@ -286,9 +319,9 @@
             "versioned_id": "browser_source",
             "settings": {
                 "is_local_file": false,
-                "local_file": "C:/Bambu2OBS_project/data/Filaments.svg",
+                "local_file": "BAMBU2OBS_DATA/Filaments.svg",
                 "url": "http://localhost:5000/view/Filaments.svg",
-                "width": 420,
+                "width": 502,
                 "height": 130,
                 "fps_custom": false,
                 "restart_when_active": true
@@ -381,7 +414,7 @@
             "id": "image_source",
             "versioned_id": "image_source",
             "settings": {
-                "file": "C:/BambuVenv/assets/fan_icon.png"
+                "file": "BAMBU2OBS_ASSETS/fan_icon.png"
             },
             "mixers": 0,
             "sync": 0,
@@ -408,7 +441,7 @@
             "versioned_id": "text_gdiplus_v2",
             "settings": {
                 "read_from_file": true,
-                "file": "C:/Bambu2OBS_project/data/coolingFanSpeed.txt",
+                "file": "BAMBU2OBS_DATA/coolingFanSpeed.txt",
                 "font": {
                     "face": "Arial",
                     "style": "Regular",
@@ -441,7 +474,7 @@
             "versioned_id": "text_gdiplus_v2",
             "settings": {
                 "read_from_file": true,
-                "file": "C:/Bambu2OBS_project/data/layerOverview.txt",
+                "file": "BAMBU2OBS_DATA/layerOverview.txt",
                 "font": {
                     "face": "Arial",
                     "style": "Regular",
@@ -474,7 +507,7 @@
             "id": "image_source",
             "versioned_id": "image_source",
             "settings": {
-                "file": "C:/FluidPrints/Flexi/4588641c-7793-42e0-8935-f70b322c8587-profile_image-300x300.png"
+                "file": ""
             },
             "mixers": 0,
             "sync": 0,
@@ -631,8 +664,8 @@
                             "y": 632.0
                         },
                         "scale": {
-                            "x": 0.5,
-                            "y": 0.5
+                            "x": 1.0,
+                            "y": 1.0
                         },
                         "align": 5,
                         "bounds_type": 0,
@@ -709,8 +742,8 @@
                             "y": 598.0
                         },
                         "scale": {
-                            "x": 0.5,
-                            "y": 0.5
+                            "x": 1.0,
+                            "y": 1.0
                         },
                         "align": 5,
                         "bounds_type": 0,
@@ -904,8 +937,8 @@
                             "y": 664.0
                         },
                         "scale": {
-                            "x": 1.0416666269302368,
-                            "y": 1.0416666269302368
+                            "x": 1.0,
+                            "y": 1.0
                         },
                         "align": 5,
                         "bounds_type": 0,
@@ -1099,8 +1132,8 @@
                             "y": 692.0
                         },
                         "scale": {
-                            "x": 0.048828125,
-                            "y": 0.048828125
+                            "x": 1.0,
+                            "y": 1.0
                         },
                         "align": 5,
                         "bounds_type": 0,
@@ -1310,6 +1343,45 @@
                         "crop_right": 0,
                         "crop_bottom": 0,
                         "id": 53,
+                        "group_item_backup": false,
+                        "scale_filter": "disable",
+                        "blend_method": "default",
+                        "blend_type": "normal",
+                        "show_transition": {
+                            "duration": 0
+                        },
+                        "hide_transition": {
+                            "duration": 0
+                        },
+                        "private_settings": {}
+                    },
+                    {
+                        "name": "AMS1TrayEXT_type",
+                        "source_uuid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                        "visible": true,
+                        "locked": true,
+                        "rot": 0.0,
+                        "pos": {
+                            "x": 1248.0,
+                            "y": 698.0
+                        },
+                        "scale": {
+                            "x": 1.0,
+                            "y": 1.0
+                        },
+                        "align": 5,
+                        "bounds_type": 0,
+                        "bounds_align": 0,
+                        "bounds_crop": false,
+                        "bounds": {
+                            "x": 0.0,
+                            "y": 0.0
+                        },
+                        "crop_left": 0,
+                        "crop_top": 0,
+                        "crop_right": 0,
+                        "crop_bottom": 0,
+                        "id": 66,
                         "group_item_backup": false,
                         "scale_filter": "disable",
                         "blend_method": "default",
@@ -1598,7 +1670,7 @@
             "versioned_id": "text_gdiplus_v2",
             "settings": {
                 "read_from_file": true,
-                "file": "C:/Bambu2OBS_project/data/nozzleTemperature.txt",
+                "file": "BAMBU2OBS_DATA/nozzleTemperature.txt",
                 "font": {
                     "face": "Arial",
                     "style": "Regular",
@@ -1631,7 +1703,7 @@
             "id": "image_source",
             "versioned_id": "image_source",
             "settings": {
-                "file": "C:/BambuVenv/assets/monitor_nozzle_temp_active.png"
+                "file": "BAMBU2OBS_ASSETS/monitor_nozzle_temp_active.png"
             },
             "mixers": 0,
             "sync": 0,
@@ -1658,7 +1730,7 @@
             "versioned_id": "text_gdiplus_v2",
             "settings": {
                 "read_from_file": true,
-                "file": "C:/Bambu2OBS_project/data/bedTemperature.txt",
+                "file": "BAMBU2OBS_DATA/bedTemperature.txt",
                 "font": {
                     "face": "Arial",
                     "style": "Regular",
@@ -1691,7 +1763,7 @@
             "id": "image_source",
             "versioned_id": "image_source",
             "settings": {
-                "file": "C:/BambuVenv/assets/monitor_bed_temp_active.png"
+                "file": "BAMBU2OBS_ASSETS/monitor_bed_temp_active.png"
             },
             "mixers": 0,
             "sync": 0,
@@ -1717,7 +1789,7 @@
             "id": "image_source",
             "versioned_id": "image_source",
             "settings": {
-                "file": "C:/BambuVenv/assets/speedometer.png"
+                "file": "BAMBU2OBS_ASSETS/speedometer.png"
             },
             "mixers": 0,
             "sync": 0,
@@ -1744,7 +1816,7 @@
             "versioned_id": "text_gdiplus_v2",
             "settings": {
                 "read_from_file": true,
-                "file": "C:/Bambu2OBS_project/data/printSpeed.txt",
+                "file": "BAMBU2OBS_DATA/printSpeed.txt",
                 "font": {
                     "face": "Arial",
                     "style": "Regular",
@@ -1777,7 +1849,7 @@
             "versioned_id": "text_gdiplus_v2",
             "settings": {
                 "read_from_file": true,
-                "file": "C:/Bambu2OBS_project/data/designTitle.txt",
+                "file": "BAMBU2OBS_DATA/designTitle.txt",
                 "font": {
                     "face": "Arial",
                     "style": "Bold",
@@ -1810,7 +1882,7 @@
             "versioned_id": "browser_source",
             "settings": {
                 "is_local_file": false,
-                "local_file": "C:/Bambu2OBS_project/src/templates/bambu2obs_progressbar_display.html",
+                "local_file": "BAMBU2OBS_SRC_TEMPLATES/bambu2obs_progressbar_display.html",
                 "undo_uuid": "8955ce7a-7506-449a-97c2-02c6b934bda0",
                 "url": "http://localhost:5000/view/progressbar",
                 "width": 550,
@@ -1849,7 +1921,7 @@
             "versioned_id": "text_gdiplus_v2",
             "settings": {
                 "read_from_file": true,
-                "file": "C:/Bambu2OBS_project/data/progressPercent.txt",
+                "file": "BAMBU2OBS_DATA/progressPercent.txt",
                 "font": {
                     "face": "Arial",
                     "style": "Bold",
@@ -1882,7 +1954,7 @@
             "id": "image_source",
             "versioned_id": "image_source",
             "settings": {
-                "file": "C:/Bambu2OBS_project/data/printCover.png"
+                "file": "BAMBU2OBS_DATA/printCover.png"
             },
             "mixers": 0,
             "sync": 0,
@@ -1909,7 +1981,7 @@
             "versioned_id": "text_gdiplus_v2",
             "settings": {
                 "read_from_file": true,
-                "file": "C:/Bambu2OBS_project/data/printProfile.txt",
+                "file": "BAMBU2OBS_DATA/printProfile.txt",
                 "font": {
                     "face": "Arial",
                     "style": "Regular",
@@ -1943,7 +2015,7 @@
             "settings": {
                 "read_from_file": true,
                 "extents": true,
-                "file": "C:/Bambu2OBS_project/data/remaining_time.txt",
+                "file": "BAMBU2OBS_DATA/remaining_time.txt",
                 "font": {
                     "face": "Arial",
                     "style": "Regular",
@@ -1979,7 +2051,7 @@
             "versioned_id": "text_gdiplus_v2",
             "settings": {
                 "read_from_file": true,
-                "file": "C:/Bambu2OBS_project/data/totalTime.txt",
+                "file": "BAMBU2OBS_DATA/totalTime.txt",
                 "font": {
                     "face": "Arial",
                     "style": "Regular",
@@ -2013,7 +2085,7 @@
             "versioned_id": "text_gdiplus_v2",
             "settings": {
                 "read_from_file": true,
-                "file": "C:/Bambu2OBS_project/data/totalWeight.txt",
+                "file": "BAMBU2OBS_DATA/totalWeight.txt",
                 "font": {
                     "face": "Arial",
                     "style": "Regular",

@@ -1,5 +1,12 @@
-<svg width="420" height="130" viewBox="0 0 420 130" fill="none" xmlns="http://www.w3.org/2000/svg">
+<svg width="502" height="130" viewBox="0 0 502 130" fill="none" xmlns="http://www.w3.org/2000/svg">
 <g id="Simplification">
+<g id="Filament5line">
+<g id="Line5">
+<path id="Line5a" d="M453 8H455V27H453V8Z" fill="#000000" opacity="0"/>
+<path id="Line5b" d="M21 9H23V82H21V9Z" fill="#000000" opacity="0"/>
+<path id="Line5c" d="M21 8H454V10H21V8Z" fill="#000000" opacity="0"/>
+</g>
+</g>
 <g id="Filament4line">
 <g id="Line4">
 <path id="Line4a" d="M372 8H374V27H372V8Z" fill="#FE9800"/>

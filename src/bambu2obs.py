@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from dotenv import load_dotenv
 import os
 import ssl
@@ -9,15 +11,33 @@ import threading
 import io
 import zipfile
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 import time
 import socket
 import subprocess
-import signal
 import sys
 import xml.etree.ElementTree as ET
 from collections import deque
 from pathlib import Path
+
+try:
+    from obs_controller import (
+        schedule_obs_kill_once,
+        reset_kill_schedule as obs_reset_kill_schedule,
+        schedule_idle_shutdown,
+        cancel_idle_shutdown,
+    )
+    _OBS_CONTROLLER_AVAILABLE = True
+except ImportError:
+    _OBS_CONTROLLER_AVAILABLE = False
+    def schedule_obs_kill_once(*_args, **_kwargs):
+        pass
+    def obs_reset_kill_schedule():
+        pass
+    def schedule_idle_shutdown():
+        pass
+    def cancel_idle_shutdown():
+        pass
 
 try:
     from bambulab import (
@@ -37,6 +57,17 @@ load_dotenv()
 
 # Additional global variable to track the first run
 is_first_run = True
+
+# Guard flag: becomes True once we have seen at least one non-FINISH / non-IDLE
+# gcode_state in this session.  Until then, a FINISH state is treated as stale
+# carry-over from the previous session (Bambu Studio remembers the last print)
+# and the OBS auto-kill is suppressed.
+_seen_active_print_this_session = False
+
+# Guard flag: becomes True once we have attempted a cloud cover refresh for an
+# actively-running cloud print in this session.  Prevents repeated API calls
+# on every MQTT message when the cover is still the placeholder.
+_cloud_cover_refresh_attempted = False
 
 subprocesses = []  # List to keep track of subprocesses
 
@@ -262,18 +293,101 @@ def _extract_preview_bytes_from_3mf(archive_bytes: bytes):
             return archive.read(selected), selected
     return None, None
 
+def _get_placeholder_cover_path() -> str:
+    """Return the absolute path to the placeholder print cover image (assets/logo.png)."""
+    repo_root = Path(__file__).resolve().parent.parent
+    return str(repo_root / 'assets' / 'logo.png')
+
+
+def ensure_placeholder_cover():
+    """
+    Copy assets/logo.png to data/printCover.png if the file does not already exist.
+    Called at startup so OBS always has a valid file to reference.
+    """
+    if os.path.exists(PRINT_COVER_IMAGE_PATH):
+        return
+    placeholder = _get_placeholder_cover_path()
+    if not os.path.exists(placeholder):
+        print(f"Placeholder cover image not found at {placeholder}; skipping.")
+        return
+    try:
+        import shutil
+        shutil.copy2(placeholder, PRINT_COVER_IMAGE_PATH)
+        update_writer_status(preview_source='placeholder')
+        print(f"Placeholder cover image copied to {PRINT_COVER_IMAGE_PATH}")
+    except OSError as exc:
+        print(f"Failed to copy placeholder cover image: {exc}")
+
+
+def clear_print_info_files():
+    """
+    Clear all print-job-specific overlay files so OBS shows nothing when no
+    print is active.  Called at startup before any MQTT messages arrive.
+
+    Also initialises sensor/status files that are only written during a print
+    so that OBS always has a valid (empty) file to reference even when the
+    data directory has just been created from scratch.
+    """
+    for filename in (
+        # Print job metadata
+        'designTitle',
+        'printProfile',
+        'totalWeight',
+        'totalTime',
+        # Live print progress
+        'remaining_time',
+        'progressPercent',
+        'progress',
+        'layerOverview',
+        'layer_num',
+        'total_layer_num',
+        # Sensor / status values
+        'coolingFanSpeed',
+        'nozzleTemperature',
+        'bedTemperature',
+        'chamberTemperature',
+        'printSpeed',
+        'printStage',
+    ):
+        write_to_file(filename, '')
+    clear_print_cover_files()
+    print("Print info files cleared/initialised (no active print at startup).")
+
+
 def clear_print_cover_files():
-    removed = False
-    for path in (PRINT_COVER_IMAGE_PATH, PRINT_COVER_LEGACY_PATH):
+    """
+    Reset the print cover back to the placeholder image.
+    Replaces printCover.png with assets/logo.png rather than deleting it,
+    so OBS always has a valid file path to display.
+    """
+    # Remove the legacy lowercase variant if it exists
+    try:
+        if os.path.exists(PRINT_COVER_LEGACY_PATH):
+            os.remove(PRINT_COVER_LEGACY_PATH)
+    except OSError as exc:
+        print(f"Failed to remove stale cover file {PRINT_COVER_LEGACY_PATH}: {exc}")
+
+    # Replace the main cover with the placeholder instead of deleting it
+    placeholder = _get_placeholder_cover_path()
+    if os.path.exists(placeholder):
         try:
-            if os.path.exists(path):
-                os.remove(path)
-                removed = True
+            import shutil
+            shutil.copy2(placeholder, PRINT_COVER_IMAGE_PATH)
+            update_writer_status(preview_source='placeholder', preview_image_cleared_at=datetime.utcnow().isoformat() + "Z")
+            print(f"Print cover reset to placeholder image.")
+            return True
         except OSError as exc:
-            print(f"Failed to remove stale cover file {path}: {exc}")
-    if removed:
-        update_writer_status(preview_source='none', preview_image_cleared_at=datetime.utcnow().isoformat() + "Z")
-    return removed
+            print(f"Failed to reset cover to placeholder: {exc}")
+
+    # Fallback: delete if placeholder is unavailable
+    try:
+        if os.path.exists(PRINT_COVER_IMAGE_PATH):
+            os.remove(PRINT_COVER_IMAGE_PATH)
+            update_writer_status(preview_source='none', preview_image_cleared_at=datetime.utcnow().isoformat() + "Z")
+            return True
+    except OSError as exc:
+        print(f"Failed to remove stale cover file {PRINT_COVER_IMAGE_PATH}: {exc}")
+    return False
 
 def save_print_cover_image(image_bytes: bytes, source_label: str):
     if not image_bytes:
@@ -685,8 +799,57 @@ class BambuCloud:
 if not os.path.exists(BASE_DIR):
     os.makedirs(BASE_DIR, exist_ok=True)
 
+def generate_obs_template():
+    """
+    Read the OBS template JSONs from obs_template/ and write patched copies to BASE_DIR
+    with all placeholder tokens replaced with the correct absolute paths for this
+    installation.  The generated files can be imported directly into OBS via
+    Scene Collection → Import.
+
+    Placeholder tokens used in the committed template files:
+        BAMBU2OBS_DATA/          → BASE_DIR  (where .txt / .png data files live)
+        BAMBU2OBS_ASSETS/        → <repo>/assets  (icons / images shipped with the repo)
+        BAMBU2OBS_SRC_TEMPLATES/ → <repo>/src/templates  (HTML progress bar template)
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    base_dir_fwd = str(BASE_DIR).replace('\\', '/')
+    assets_dir_fwd = str(repo_root / 'assets').replace('\\', '/')
+    src_templates_fwd = str(repo_root / 'src' / 'templates').replace('\\', '/')
+
+    templates = [
+        ('Bambu2OBS_Dashboard.json', 'Bambu2OBS_Dashboard_generated.json'),
+        ('Bambu2OBS_Scene.json',     'Bambu2OBS_Scene_generated.json'),
+    ]
+
+    for src_name, out_name in templates:
+        template_path = repo_root / 'obs_template' / src_name
+        output_path = Path(BASE_DIR) / out_name
+
+        if not template_path.exists():
+            print(f"OBS template not found at {template_path}; skipping.")
+            continue
+
+        try:
+            content = template_path.read_text(encoding='utf-8')
+
+            # Simple token replacement — no regex needed.
+            content = content.replace('BAMBU2OBS_DATA/', base_dir_fwd + '/')
+            content = content.replace('BAMBU2OBS_ASSETS/', assets_dir_fwd + '/')
+            content = content.replace('BAMBU2OBS_SRC_TEMPLATES/', src_templates_fwd + '/')
+
+            output_path.write_text(content, encoding='utf-8')
+            print(f"OBS template generated: {output_path}")
+        except Exception as exc:
+            print(f"Failed to generate OBS template {src_name}: {exc}")
+
+generate_obs_template()
+
+# Ensure printCover.png always exists so OBS never complains about a missing file.
+# Uses assets/logo.png as a placeholder when no print cover has been downloaded yet.
+ensure_placeholder_cover()
+
 update_writer_status(state="initialized")
-        
+
 def format_remaining_time(minutes):
     """Formats remaining time from minutes to '-HhMm'."""
     hours, minutes = divmod(minutes, 60)
@@ -829,6 +992,76 @@ def hex_to_rgb_percent(hex_color):
     r, g, b = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
     return f"rgb({r/255*100}%,{g/255*100}%,{b/255*100}%)"
 
+# Named color palette for nearest-neighbor matching (R, G, B)
+_NAMED_COLORS = {
+    "White":        (255, 255, 255),
+    "Light Gray":   (211, 211, 211),
+    "Gray":         (128, 128, 128),
+    "Dark Gray":    ( 64,  64,  64),
+    "Black":        (  0,   0,   0),
+    "Red":          (255,   0,   0),
+    "Dark Red":     (139,   0,   0),
+    "Orange":       (255, 165,   0),
+    "Dark Orange":  (255, 140,   0),
+    "Yellow":       (255, 255,   0),
+    "Yellow Green": (154, 205,  50),
+    "Green":        (  0, 128,   0),
+    "Lime":         (  0, 255,   0),
+    "Dark Green":   (  0, 100,   0),
+    "Cyan":         (  0, 255, 255),
+    "Teal":         (  0, 128, 128),
+    "Blue":         (  0,   0, 255),
+    "Royal Blue":   ( 65, 105, 225),
+    "Navy":         (  0,   0, 128),
+    "Sky Blue":     (135, 206, 235),
+    "Purple":       (128,   0, 128),
+    "Dark Purple":  ( 75,   0, 130),
+    "Indigo":       ( 55,   0, 110),
+    "Violet":       (238, 130, 238),
+    "Magenta":      (255,   0, 255),
+    "Pink":         (255, 192, 203),
+    "Hot Pink":     (255, 105, 180),
+    "Brown":        (165,  42,  42),
+    "Tan":          (210, 180, 140),
+    "Beige":        (245, 245, 220),
+    "Gold":         (255, 215,   0),
+    "Silver":       (192, 192, 192),
+    "Transparent":  (  0,   0,   0),  # placeholder; handled separately
+}
+
+def hex_to_color_name(hex_color: str) -> str:
+    """Return the nearest human-readable color name for a hex color string.
+
+    Accepts RRGGBB or RRGGBBAA (alpha is ignored).  Always returns a name.
+    """
+    if not hex_color or hex_color in ('N/A', 'Unknown'):
+        return 'N/A'
+    cleaned = hex_color.lstrip('#')
+    if len(cleaned) < 6:
+        return 'N/A'
+    try:
+        r = int(cleaned[0:2], 16)
+        g = int(cleaned[2:4], 16)
+        b = int(cleaned[4:6], 16)
+        # Treat near-transparent colors (very low alpha) as "Transparent"
+        if len(cleaned) == 8:
+            a = int(cleaned[6:8], 16)
+            if a < 30:
+                return 'Transparent'
+    except ValueError:
+        return 'N/A'
+
+    best_name = 'Unknown'
+    best_dist = float('inf')
+    for name, (nr, ng, nb) in _NAMED_COLORS.items():
+        if name == 'Transparent':
+            continue
+        dist = (r - nr) ** 2 + (g - ng) ** 2 + (b - nb) ** 2
+        if dist < best_dist:
+            best_dist = dist
+            best_name = name
+    return best_name
+
 # Helper function to read filament color from file
 def read_filament_color_from_file(tray_idx):
     color_file_path = os.path.join(BASE_DIR, f'ams{tray_idx}FilamentColor.txt')
@@ -854,8 +1087,8 @@ def update_svg_with_all_tray_colors():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     input_svg_path = os.path.join(script_dir, "templates", "Filaments.svg")
     active_input_svg_path = os.path.join(script_dir, "templates", "ActiveFilament.svg")
-    output_svg_path = os.path.join(script_dir, os.pardir, "data", "Filaments.svg")
-    active_output_svg_path = os.path.join(script_dir, os.pardir, "data", "ActiveFilament.svg")
+    output_svg_path = os.path.join(BASE_DIR, "Filaments.svg")
+    active_output_svg_path = os.path.join(BASE_DIR, "ActiveFilament.svg")
     
     tree = ET.parse(input_svg_path)
     active_tree = ET.parse(active_input_svg_path)
@@ -864,55 +1097,80 @@ def update_svg_with_all_tray_colors():
     namespaces = {'svg': 'http://www.w3.org/2000/svg'}
     ET.register_namespace('', 'http://www.w3.org/2000/svg')
     
-    # Correctly read the active tray value from file
+    # Correctly read the active tray value from file.
+    # '0' is the sentinel for "no active tray" (written when tray_now=255 or on startup).
+    # Values 1-4 are valid 1-based tray indices.
     try:
         active_ams_tray = int(read_active_ams_tray_from_file())
     except (TypeError, ValueError):
         active_ams_tray = None
-    
-    for tray_idx in range(1, 5):
+
+    # Treat 0 explicitly as "no active tray" so the SVG renders cleanly.
+    no_active_tray = (active_ams_tray is None or active_ams_tray == 0)
+
+    for tray_idx in range(1, 6):
         filament_color = read_filament_color_from_file(tray_idx)
         rgb_color = hex_to_rgb_percent(filament_color) if filament_color and filament_color != 'N/A' else None
-        
+
         if rgb_color:
-            # Update Filaments.svg
+            # Update Filaments.svg color fill
             element_id = f'Color{tray_idx}'
             element = root.find(f".//*[@id='{element_id}']", namespaces)
             if element is not None:
                 element.set('fill', rgb_color)
-            
-            # Update ActiveFilament.svg for lines
-            for line_part in ['a', 'b', 'c']:
-                line_id = f'Line{tray_idx}{line_part}'
-                line_element = active_root.find(f".//*[@id='{line_id}']", namespaces)
-                if line_element is not None:
+
+        # Always update ActiveFilament.svg line opacity for every tray,
+        # even when rgb_color is unavailable, so stale template values are
+        # never left in place.
+        for line_part in ['a', 'b', 'c']:
+            line_id = f'Line{tray_idx}{line_part}'
+            line_element = active_root.find(f".//*[@id='{line_id}']", namespaces)
+            if line_element is not None:
+                if rgb_color:
                     line_element.set('fill', rgb_color)
-                    # Set opacity based on active tray
-                    line_element.set('opacity', '0' if tray_idx != active_ams_tray else '1')
+                # Show this tray's line only when it is the active tray and
+                # there IS an active tray.  Hide it in all other cases.
+                is_active = (not no_active_tray) and (tray_idx == active_ams_tray)
+                line_element.set('opacity', '1' if is_active else '0')
 
-        # Set active filament tray by highlighting the corrected numbered circle
-        circle_element_id = f'Circle{tray_idx}'
-        circle_element = root.find(f".//*[@id='{circle_element_id}']", namespaces)
-        if circle_element is not None:
-            if active_ams_tray is not None and tray_idx == active_ams_tray:
-                circle_element.set('fill', 'green')  # Active tray
-            else:
-                circle_element.set('fill', 'gray')  # Inactive trays
+        # Set active filament tray by highlighting the numbered circle (trays 1-4)
+        # or the EXT rectangle (tray 5).
+        if tray_idx <= 4:
+            circle_element_id = f'Circle{tray_idx}'
+            circle_element = root.find(f".//*[@id='{circle_element_id}']", namespaces)
+            if circle_element is not None:
+                if (not no_active_tray) and tray_idx == active_ams_tray:
+                    circle_element.set('fill', 'green')  # Active tray
+                else:
+                    circle_element.set('fill', 'gray')  # Inactive / no active tray
+        else:
+            # Tray 5 = EXT: highlight the Rect5 rectangle instead of a circle
+            rect_element = root.find(".//*[@id='Rect5']", namespaces)
+            if rect_element is not None:
+                if (not no_active_tray) and active_ams_tray == 5:
+                    rect_element.set('fill', 'green')
+                else:
+                    rect_element.set('fill', '#7B7B7B')
 
-    # Check if the active tray is within the expected range (1-4)
-    if active_ams_tray is not None and 1 <= active_ams_tray <= 4:
-        active_tray_color = read_filament_color_from_file(active_ams_tray)
-        active_rgb_color = hex_to_rgb_percent(active_tray_color) if active_tray_color and active_tray_color != 'N/A' else None
-        if active_rgb_color:
-            color_element = active_root.find(".//*[@id='Extruder']/*[@id='Color']", namespaces)
-            if color_element is not None:
+    # Update the extruder colour indicator.
+    color_element = active_root.find(".//*[@id='Extruder']/*[@id='Color']", namespaces)
+    if color_element is not None:
+        if not no_active_tray:
+            # Active tray in range 1-4: show its colour.
+            active_tray_color = read_filament_color_from_file(active_ams_tray)
+            active_rgb_color = (
+                hex_to_rgb_percent(active_tray_color)
+                if active_tray_color and active_tray_color != 'N/A'
+                else None
+            )
+            if active_rgb_color:
                 color_element.set('fill', active_rgb_color)
-                color_element.set('opacity', '1')  # Ensure the active tray color is fully opaque
-    else:
-        # If active_ams_tray is outside the expected range, make the extruder color transparent
-        color_element = active_root.find(".//*[@id='Extruder']/*[@id='Color']", namespaces)
-        if color_element is not None:
-            color_element.set('opacity', '0')  # Make the extruder color transparent if no valid tray is active
+                color_element.set('opacity', '1')
+            else:
+                color_element.set('opacity', '0')
+        else:
+            # No active tray (sentinel 0, None, or out-of-range): hide extruder colour.
+            color_element.set('opacity', '0')
 
 
     # Save the modified SVGs
@@ -924,6 +1182,27 @@ def update_svg_with_all_tray_colors():
 # Load the persisted total_layer_num at script startup
 total_layer_num_global = load_from_file("total_layer_num", None)
 previous_task_id = load_last_processed_task_id()
+
+# Initialize activeAmsTray.txt to '0' (no active tray) if not already set,
+# then render the SVG so OBS always has a valid file from the moment the server starts.
+_active_ams_tray_path = os.path.join(BASE_DIR, 'activeAmsTray.txt')
+if not os.path.exists(_active_ams_tray_path):
+    write_to_file('activeAmsTray', '0')
+    print("Initialized activeAmsTray.txt to '0' (no active tray).")
+
+# Ensure EXT spool (tray 5) files always exist so OBS never complains about
+# a missing file on first launch before any MQTT data arrives.
+for _ext_file in ('ams5FilamentColor', 'ams5FilamentColorName', 'ams5FilamentName'):
+    _ext_path = os.path.join(BASE_DIR, f'{_ext_file}.txt')
+    if not os.path.exists(_ext_path):
+        _default = '000000' if _ext_file == 'ams5FilamentColor' else ('Black' if _ext_file == 'ams5FilamentColorName' else 'Unknown Filament')
+        write_to_file(_ext_file, _default)
+        print(f"Initialized {_ext_file}.txt with default value.")
+update_svg_with_all_tray_colors()
+
+# Clear all print-job-specific overlay files at startup so OBS shows nothing
+# until a real print is detected in this session.
+clear_print_info_files()
 
 def on_connect(client, userdata, flags, reason_code, properties=None):
     print(f"Connected with result code {reason_code}")
@@ -966,6 +1245,7 @@ def on_message(client, userdata, msg):
                 reset_layer_tracking()
                 clear_print_cover_files()
                 write_to_file('printCover', 'N/A')
+                obs_reset_kill_schedule()  # Re-arm OBS auto-kill for the new job
                 previous_task_id = current_task_id  # Update the last known task ID
                 persist_latest_task_id(current_task_id)
                 # Reconnect to Bambu Cloud to fetch the latest task information
@@ -997,79 +1277,120 @@ def convert_all_to_str(data):
         return str(data)
 
 def handle_print_data(print_data):
-    global total_layer_num_global, latest_print_data
+    global total_layer_num_global, latest_print_data, _seen_active_print_this_session
     latest_print_data = dict(print_data)
-    # Process print profile name
-    if 'subtask_name' in print_data:
-        write_to_file('printProfile', print_data['subtask_name'])
-    ensure_job_name_from_print(print_data)
 
-    if 'gcode_file' in print_data:
-        write_to_file('gcodeFile', print_data['gcode_file'])
-    if 'file' in print_data:
-        write_to_file('printFile', print_data['file'])
+    gcode_state = str(print_data.get('gcode_state', '')).upper()
 
-    # Process print progress
-    if 'mc_percent' in print_data:
-        write_to_file('progressPercent', f"{print_data['mc_percent']}%")
-        write_to_file('progress', print_data['mc_percent'])
+    # -----------------------------------------------------------------------
+    # Session-guard: if the printer is reporting a stale FINISH/IDLE state
+    # from the previous session (Bambu Studio remembers the last print), skip
+    # writing print-state data to the overlay files so the dashboard stays
+    # blank/clean until a real print starts in this session.
+    # AMS slot data (filament colors/names) is still updated — it reflects the
+    # physical contents of the AMS and is always valid.
+    # -----------------------------------------------------------------------
+    is_stale_session_state = (
+        gcode_state in ('FINISH', 'IDLE', 'FAILED')
+        and not _seen_active_print_this_session
+    )
 
-    if 'mc_remaining_time' in print_data:
-        formatted_time = format_remaining_time(int(print_data['mc_remaining_time']))
-        write_to_file('remaining_time', formatted_time)
+    if not is_stale_session_state:
+        # Process print profile name
+        if 'subtask_name' in print_data:
+            write_to_file('printProfile', print_data['subtask_name'])
+        ensure_job_name_from_print(print_data)
 
-    # Process cooling fan speed
-    if 'cooling_fan_speed' in print_data:
-        cooling_fan_speed = float(print_data['cooling_fan_speed'])
-        calculated_speed = (cooling_fan_speed / 15) * 100  # Assuming 15 is the max speed for normalization
-        write_to_file('coolingFanSpeed', f"{calculated_speed:.2f}")
+        if 'gcode_file' in print_data:
+            write_to_file('gcodeFile', print_data['gcode_file'])
+        if 'file' in print_data:
+            write_to_file('printFile', print_data['file'])
 
-    # Process print speed level
-    if "spd_lvl" in print_data:
-        print(f"Received spd_lvl: {print_data['spd_lvl']}")
-        print(f"SPEED_PROFILE keys: {list(SPEED_PROFILE.keys())}")
+        # Process print progress
+        if 'mc_percent' in print_data:
+            write_to_file('progressPercent', f"{print_data['mc_percent']}%")
+            write_to_file('progress', print_data['mc_percent'])
 
-        spd_lvl_value = int(print_data["spd_lvl"])  # Convert spd_lvl to integer
-        speed_level_name = SPEED_PROFILE.get(spd_lvl_value, "Unknown Speed Level")
+        if 'mc_remaining_time' in print_data:
+            formatted_time = format_remaining_time(int(print_data['mc_remaining_time']))
+            write_to_file('remaining_time', formatted_time)
 
-        # Ensure the first letter is uppercase without altering the case of the rest of the string
-        speed_level_name = speed_level_name[0].upper() + speed_level_name[1:]
+        # Process cooling fan speed
+        if 'cooling_fan_speed' in print_data:
+            cooling_fan_speed = float(print_data['cooling_fan_speed'])
+            calculated_speed = (cooling_fan_speed / 15) * 100  # Assuming 15 is the max speed for normalization
+            write_to_file('coolingFanSpeed', f"{int(round(calculated_speed))}%")
 
-        print(f"Matched speed level name: {speed_level_name}")  # Debug print
-        write_to_file('printSpeed', speed_level_name)
+        # Process print speed level
+        if "spd_lvl" in print_data:
+            print(f"Received spd_lvl: {print_data['spd_lvl']}")
+            print(f"SPEED_PROFILE keys: {list(SPEED_PROFILE.keys())}")
 
-    if "mc_print_stage" in print_data:
-        print(f"Received mc_print_stage: {print_data['mc_print_stage']}")
-        print(f"CURRENT_STAGE_IDS keys: {list(CURRENT_STAGE_IDS.keys())}")
+            spd_lvl_value = int(print_data["spd_lvl"])  # Convert spd_lvl to integer
+            speed_level_name = SPEED_PROFILE.get(spd_lvl_value, "N/A")
 
-        mc_print_stage_key = str(print_data['mc_print_stage'])
-        mc_print_stage_name = CURRENT_STAGE_IDS.get(mc_print_stage_key, "Unknown Print Stage")
-        print(f"Matched print stage name: {mc_print_stage_name}")  # Debug print
-        write_to_file('printStage', mc_print_stage_name)
-        
-    # Process layer number
-    if "layer_num" in print_data:
-        current_layer = str(print_data['layer_num'])
-        write_to_file("layer_num", current_layer)
-        total_display = total_layer_num_global if total_layer_num_global not in (None, '') else '?'
-        layer_overview_content = f"Layer: {current_layer} / {total_display}"
-        write_to_file("layerOverview", layer_overview_content)
+            # Ensure the first letter is uppercase without altering the case of the rest of the string
+            if speed_level_name and speed_level_name != "N/A":
+                speed_level_name = speed_level_name[0].upper() + speed_level_name[1:]
 
-    # Process total layer number
-    if "total_layer_num" in print_data:
-        total_layer_num_global = str(print_data['total_layer_num'])
-        write_to_file("total_layer_num", total_layer_num_global)
-        last_layer = load_from_file("layer_num")
-        if last_layer:
-            write_to_file("layerOverview", f"Layer: {last_layer} / {total_layer_num_global}")
+            print(f"Matched speed level name: {speed_level_name}")  # Debug print
+            write_to_file('printSpeed', speed_level_name)
 
-    # Process temperatures
-    if 'bed_temper' in print_data:
-        write_to_file('bedTemperature', f"{float(print_data['bed_temper']):.2f}")
-    if 'nozzle_temper' in print_data:
-        write_to_file('nozzleTemperature', f"{float(print_data['nozzle_temper']):.2f}")
+        if "mc_print_stage" in print_data:
+            print(f"Received mc_print_stage: {print_data['mc_print_stage']}")
+            print(f"CURRENT_STAGE_IDS keys: {list(CURRENT_STAGE_IDS.keys())}")
 
-    # Process AMS trays
+            mc_print_stage_key = str(print_data['mc_print_stage'])
+            mc_print_stage_name = CURRENT_STAGE_IDS.get(mc_print_stage_key, "N/A")
+            print(f"Matched print stage name: {mc_print_stage_name}")  # Debug print
+            write_to_file('printStage', mc_print_stage_name)
+
+        # Process layer number
+        if "layer_num" in print_data:
+            current_layer = str(print_data['layer_num'])
+            write_to_file("layer_num", current_layer)
+            total_display = total_layer_num_global if total_layer_num_global not in (None, '') else '?'
+            layer_overview_content = f"Layer: {current_layer} / {total_display}"
+            write_to_file("layerOverview", layer_overview_content)
+
+        # Process total layer number
+        if "total_layer_num" in print_data:
+            total_layer_num_global = str(print_data['total_layer_num'])
+            write_to_file("total_layer_num", total_layer_num_global)
+            last_layer = load_from_file("layer_num")
+            if last_layer:
+                write_to_file("layerOverview", f"Layer: {last_layer} / {total_layer_num_global}")
+
+        # Process temperatures
+        if 'bed_temper' in print_data:
+            write_to_file('bedTemperature', f"{int(round(float(print_data['bed_temper'])))}°C")
+        if 'nozzle_temper' in print_data:
+            write_to_file('nozzleTemperature', f"{int(round(float(print_data['nozzle_temper'])))}°C")
+
+        # Chamber temperature: try the legacy top-level field first, then the
+        # newer device.ctc.info.temp path used by P1S/P2S firmware.
+        chamber_temp = None
+        if 'chamber_temper' in print_data:
+            try:
+                chamber_temp = float(print_data['chamber_temper'])
+            except (TypeError, ValueError):
+                pass
+        if chamber_temp is None:
+            try:
+                chamber_temp = float(print_data['device']['ctc']['info']['temp'])
+            except (KeyError, TypeError, ValueError):
+                pass
+        if chamber_temp is not None:
+            write_to_file('chamberTemperature', f"{int(round(chamber_temp))}°C")
+
+    else:
+        print(
+            f"Skipping stale print-state data writes (gcode_state={gcode_state}, "
+            "no active print seen this session)."
+        )
+
+    # AMS slot data is always written — it reflects the physical AMS contents
+    # regardless of print state.
     if 'ams' in print_data and 'ams' in print_data['ams']:
         ams_entries = print_data['ams']['ams']
         if ams_entries and 'tray' in ams_entries[0]:
@@ -1078,13 +1399,41 @@ def handle_print_data(print_data):
                 filament_id = tray.get('tray_info_idx', 'Unknown')
                 filament_color = tray.get('tray_color', 'N/A')
                 filament_name = FILAMENT_NAMES.get(filament_id, "Unknown Filament")
+                filament_color_name = hex_to_color_name(filament_color)
                 write_to_file(f'ams{tray_idx}FilamentId', filament_id)
                 write_to_file(f'ams{tray_idx}FilamentColor', filament_color)
+                write_to_file(f'ams{tray_idx}FilamentColorName', filament_color_name)
                 write_to_file(f'ams{tray_idx}FilamentName', filament_name)
         else:
             print("AMS data present but no tray info available; skipping tray processing.")
 
-    # Process active AMS tray
+    # Parse vt_tray (external spool) color — always update tray 5 color and
+    # color-name files so the EXT spool shows the correct filament color in
+    # the SVG and OBS text sources.
+    if 'ams' in print_data and 'vt_tray' in print_data['ams']:
+        vt_tray = print_data['ams']['vt_tray']
+        if isinstance(vt_tray, dict):
+            ext_color = vt_tray.get('tray_color', '')
+            ext_filament_id = vt_tray.get('tray_info_idx', '')
+            ext_filament_name = FILAMENT_NAMES.get(ext_filament_id, 'Unknown Filament') if ext_filament_id else 'Unknown Filament'
+        else:
+            ext_color = str(vt_tray).strip()
+            ext_filament_name = 'Unknown Filament'
+        # Only write if we got a valid 6/8-char hex color; otherwise default to black
+        if ext_color and len(ext_color.lstrip('#')) >= 6:
+            clean_color = ext_color.lstrip('#')
+            write_to_file('ams5FilamentColor', clean_color)
+            write_to_file('ams5FilamentColorName', hex_to_color_name(clean_color))
+        else:
+            # Default to black when no color info is available
+            _existing_ext_color = read_filament_color_from_file(5)
+            if not _existing_ext_color:
+                write_to_file('ams5FilamentColor', '000000')
+                write_to_file('ams5FilamentColorName', 'Black')
+        write_to_file('ams5FilamentName', ext_filament_name)
+
+    # Process active AMS tray — always update so the SVG reflects the current
+    # tray state (or "no active tray" when tray_now=255).
     if 'ams' in print_data and 'tray_now' in print_data['ams']:
         try:
             active_tray_zero_based = int(print_data['ams']['tray_now'])
@@ -1092,13 +1441,23 @@ def handle_print_data(print_data):
                 active_tray = active_tray_zero_based + 1  # Adjusting from 0-based to 1-based indexing
                 write_to_file('activeAmsTray', str(active_tray))
                 update_svg_with_all_tray_colors()
+            elif active_tray_zero_based == 254:
+                # tray_now=254 means the external spool (vt_tray) is active.
+                # Map this to tray index 5 (EXT spool).
+                print(f"External spool active (tray_now=254); setting activeAmsTray to 5.")
+                write_to_file('activeAmsTray', '5')
+                update_svg_with_all_tray_colors()
             else:
-                print(f"Ignoring invalid active AMS tray value: {active_tray_zero_based}")
+                # tray_now=255 (or any other out-of-range value) means no filament
+                # is actively loaded/feeding.  Write '0' as the sentinel for
+                # "no active tray" and update the SVG to reflect that state.
+                print(f"No active AMS tray (tray_now={active_tray_zero_based}); setting activeAmsTray to 0.")
+                write_to_file('activeAmsTray', '0')
+                update_svg_with_all_tray_colors()
         except (TypeError, ValueError):
             print(f"Could not parse active AMS tray value: {print_data['ams']['tray_now']}")
 
     print_type = str(print_data.get('print_type', '')).lower()
-    gcode_state = str(print_data.get('gcode_state', '')).upper()
     should_attempt_sd_preview = (
         print_type in ('local', 'lan')
         and gcode_state not in ('IDLE', 'FAILED', 'FINISH')
@@ -1110,6 +1469,55 @@ def handle_print_data(print_data):
             clear_print_cover_files()
             write_to_file('printCover', 'N/A')
         attempt_sdcard_preview_fallback(print_data=print_data, force=False)
+
+    # Cloud print cover refresh: if the printer is actively printing a cloud
+    # job and the cover is still the placeholder (logo), attempt a one-time
+    # cloud task refresh to download the real thumbnail.
+    global _cloud_cover_refresh_attempted
+    if (
+        not _cloud_cover_refresh_attempted
+        and print_type == 'cloud'
+        and gcode_state not in ('IDLE', 'FAILED', 'FINISH', '')
+        and writer_status.get('preview_source') == 'placeholder'
+    ):
+        _cloud_cover_refresh_attempted = True
+        print("Active cloud print detected with placeholder cover — triggering cloud cover refresh.")
+        def _refresh_cloud_cover():
+            try:
+                cloud = BambuCloud(REGION, EMAIL, PASSWORD, auth_token=CLOUD_AUTH_TOKEN)
+                cloud.login()
+                process_latest_task(cloud, PRINTER_SN, BASE_DIR, force_update=True)
+            except Exception as exc:
+                print(f"Cloud cover refresh failed: {exc}")
+        threading.Thread(target=_refresh_cloud_cover, daemon=True).start()
+
+    # Auto-kill OBS when the print finishes.
+    #
+    # Guard against stale FINISH state on startup:
+    # Bambu Studio remembers the last print and the printer will immediately
+    # report gcode_state=FINISH after connecting, even when no print has run
+    # in this session.  We only arm the kill once we have seen at least one
+    # genuinely active print state (RUNNING / PREPARE / etc.) since startup.
+    # That way, opening OBS to tweak the dashboard while the printer is idle
+    # will never trigger an unwanted shutdown.
+    if gcode_state not in ('FINISH', 'IDLE', 'FAILED', ''):
+        # Any actively-printing state arms the session guard.
+        # Also cancel the idle shutdown timer — a real print is in progress.
+        if not _seen_active_print_this_session:
+            print("Active print detected — cancelling idle shutdown timer.")
+            cancel_idle_shutdown()
+        _seen_active_print_this_session = True
+
+    if gcode_state == 'FINISH':
+        if not _seen_active_print_this_session:
+            print(
+                "Print state is FINISH but no active print was seen this session — "
+                "likely stale state carried over from previous session. "
+                "Skipping OBS auto-kill."
+            )
+        else:
+            print("Print finished (gcode_state=FINISH). Scheduling OBS auto-kill if enabled.")
+            schedule_obs_kill_once()
 
 def format_time_hms(seconds):
     """Formats time from seconds to 'HhMmSs'."""
@@ -1175,10 +1583,12 @@ def process_latest_task(bambu_cloud, printer_sn, base_dir, force_update=False):
     global is_first_run, previous_task_id, latest_print_data
     if bambu_cloud is None:
         print("Cloud client not available; skipping latest task processing.")
+        is_first_run = False
         attempt_sdcard_preview_fallback(print_data=latest_print_data, force=force_update)
         return
     if not printer_sn:
         print("Printer serial number not configured; skipping latest task processing.")
+        is_first_run = False
         return
 
     device_id = bambu_cloud.get_device_id_for_serial(printer_sn)
@@ -1191,6 +1601,7 @@ def process_latest_task(bambu_cloud, printer_sn, base_dir, force_update=False):
 
     if not latest_task:
         print("No tasks found for this printer. Skipping task processing.")
+        is_first_run = False
         attempt_sdcard_preview_fallback(print_data=latest_print_data, force=force_update)
         return
 
@@ -1199,6 +1610,26 @@ def process_latest_task(bambu_cloud, printer_sn, base_dir, force_update=False):
     last_processed_task_id = load_last_processed_task_id(task_id_path)
 
     current_task_id = str(latest_task.get('id'))
+
+    # On the very first run (startup), always skip writing overlay files unless
+    # this is a forced update (which only happens when a new print is detected
+    # via MQTT).  The Bambu Cloud API always returns the last completed task
+    # regardless of whether the printer is currently printing, so we cannot
+    # safely populate the dashboard from cloud data at startup — we'd always
+    # show stale history.  The files were already cleared by
+    # clear_print_info_files() at startup; we just record the task ID so that
+    # a genuinely new task is detected correctly when printing begins.
+    if is_first_run and not force_update:
+        task_status = str(latest_task.get('status', 'unknown')).lower().strip()
+        print(
+            f"Startup: skipping overlay file writes for cloud task "
+            f"(id={current_task_id}, status={task_status!r}) — "
+            "dashboard stays blank until a real print starts."
+        )
+        persist_latest_task_id(current_task_id, task_id_path)
+        previous_task_id = current_task_id
+        is_first_run = False
+        return
 
     # Check if this is a forced update or if the task info has changed
     if force_update or current_task_id != last_processed_task_id:
@@ -1289,8 +1720,11 @@ def main():
         )
         print(f"Unable to initialize Bambu Cloud connection: {e}")
     
-    # Process the latest task from Bambu Cloud, forcing update on the first run (if available)
-    process_latest_task(bambu_cloud, PRINTER_SN, BASE_DIR, force_update=is_first_run)
+    # At startup, only record the latest cloud task ID so we can detect a
+    # genuinely new print later — never force-write stale cloud data to the
+    # overlay files.  The files were already cleared by clear_print_info_files()
+    # above; we keep them blank until a real print is detected via MQTT.
+    process_latest_task(bambu_cloud, PRINTER_SN, BASE_DIR, force_update=False)
 
     server_proc = launch_progress_server()
     update_writer_status(
@@ -1300,9 +1734,12 @@ def main():
     print("Progress bar server started.")
 
     try:
-        # Process the latest task from Bambu Cloud, if any
-        process_latest_task(bambu_cloud, PRINTER_SN, BASE_DIR)
-        print("Latest task processed.")
+        # (Startup task already processed above — no second call needed.)
+        print("Latest task ID recorded; waiting for MQTT print activity.")
+
+        # Start the idle shutdown timer.  If no active print is detected within
+        # SERVER_IDLE_TIMEOUT minutes the server will shut itself down.
+        schedule_idle_shutdown()
 
         # Setup and start MQTT listener for real-time printer status updates
         print("Connecting to the printer's local MQTT service...")
